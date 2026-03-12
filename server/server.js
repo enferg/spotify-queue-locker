@@ -16,6 +16,8 @@ app.use(cors({
 
 // sessionId → session data
 const sessions = new Map();
+// clientId → sessionId (one active lock per user)
+const clientIndex = new Map();
 
 /* ================================================================
    SPOTIFY HELPERS
@@ -74,6 +76,7 @@ async function ensureFreshToken(session) {
    WATCHDOG
    ================================================================ */
 async function snapBack(sessionId, session, playback) {
+  if (!session.active) return;
   session.snapCooldown = true;
   const { trackUris, trackIndex } = session;
   const deviceId = playback?.device?.id;
@@ -156,6 +159,16 @@ async function watchdogTick(sessionId) {
 /* ================================================================
    API
    ================================================================ */
+function killSession(sessionId) {
+  const session = sessions.get(sessionId);
+  if (!session) return;
+  session.active = false;
+  clearInterval(session.timer);
+  clientIndex.delete(session.clientId);
+  sessions.delete(sessionId);
+  console.log(`[${sessionId}] killed`);
+}
+
 app.get('/api/health', (_, res) => res.json({ ok: true }));
 
 app.post('/api/lock', (req, res) => {
@@ -164,6 +177,10 @@ app.post('/api/lock', (req, res) => {
   if (!accessToken || !refreshToken || !clientId || !trackUris?.length) {
     return res.status(400).json({ error: 'Missing required fields' });
   }
+
+  // Kill any existing session for this user
+  const existing = clientIndex.get(clientId);
+  if (existing) killSession(existing);
 
   const sessionId = crypto.randomUUID();
   const session = {
@@ -175,26 +192,46 @@ app.post('/api/lock', (req, res) => {
     trackIndex:   trackIndex ?? 0,
     albumName,
     albumArt,
+    active:       true,
     snapCooldown: false,
     lastProgress: null,
   };
 
   session.timer = setInterval(() => watchdogTick(sessionId), 2000);
   sessions.set(sessionId, session);
+  clientIndex.set(clientId, sessionId);
 
   console.log(`[${sessionId}] locked — ${trackUris.length} tracks`);
   res.json({ sessionId });
 });
 
 app.post('/api/unlock', (req, res) => {
-  const { sessionId } = req.body;
-  const session = sessions.get(sessionId);
-  if (session) {
-    clearInterval(session.timer);
-    sessions.delete(sessionId);
-    console.log(`[${sessionId}] unlocked`);
+  const { sessionId, clientId } = req.body;
+  console.log(`unlock request received — sessionId=${sessionId} clientId=${clientId}`);
+  if (sessionId) killSession(sessionId);
+  // Also kill by clientId in case of orphaned sessions
+  if (clientId) {
+    const cid = clientIndex.get(clientId);
+    if (cid && cid !== sessionId) killSession(cid);
   }
   res.json({ ok: true });
+});
+
+// Lets the frontend find its session on page load without a stored sessionId
+app.get('/api/find-session/:clientId', (req, res) => {
+  const sessionId = clientIndex.get(req.params.clientId);
+  if (!sessionId || !sessions.has(sessionId)) {
+    clientIndex.delete(req.params.clientId);
+    return res.json({ sessionId: null });
+  }
+  const session = sessions.get(sessionId);
+  res.json({
+    sessionId,
+    trackIndex: session.trackIndex,
+    trackCount: session.trackUris.length,
+    albumName:  session.albumName,
+    albumArt:   session.albumArt,
+  });
 });
 
 app.get('/api/status/:sessionId', (req, res) => {

@@ -857,17 +857,19 @@ let state = {
 /* ================================================================
    UTILITIES
    ================================================================ */
+const IS_LOCAL = window.location.hostname === '127.0.0.1' || window.location.hostname === 'localhost';
+
 function getRedirectUri() {
+  if (IS_LOCAL) return window.location.origin + window.location.pathname;
   const stored = sessionStorage.getItem(KEY.REDIRECT_URI);
   if (stored) return stored;
   if (CONFIG.REDIRECT_URI) return CONFIG.REDIRECT_URI;
-  // Strip query params & hash from current URL
   return window.location.origin + window.location.pathname;
 }
 
 function getServerUrl() {
-  if (CONFIG.SERVER_URL) return CONFIG.SERVER_URL;
-  return 'http://localhost:3000';
+  if (IS_LOCAL) return 'http://localhost:3000';
+  return CONFIG.SERVER_URL;
 }
 
 function getClientId() {
@@ -1121,6 +1123,16 @@ async function lockQueue() {
   btn.disabled = true;
   btn.textContent = 'LOCKING…';
 
+  // Kill any existing server session before creating a new one
+  if (state.sessionId) {
+    await fetch(`${getServerUrl()}/api/unlock`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionId: state.sessionId }),
+    }).catch(() => {});
+    state.sessionId = null;
+  }
+
   try {
     const [playback, queueData] = await Promise.all([getPlaybackState(), getQueue()]);
 
@@ -1192,11 +1204,11 @@ async function unlockQueue(serverAlreadyGone = false) {
   sessionStorage.removeItem(KEY.SESSION_ID);
   sessionStorage.removeItem(KEY.LOCK_DATA);
 
-  if (sessionId && !serverAlreadyGone) {
-    fetch(`${getServerUrl()}/api/unlock`, {
+  if (!serverAlreadyGone) {
+    await fetch(`${getServerUrl()}/api/unlock`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sessionId }),
+      body: JSON.stringify({ sessionId, clientId: getClientId() }),
     }).catch(() => {});
   }
 
@@ -1210,7 +1222,22 @@ async function unlockQueue(serverAlreadyGone = false) {
 }
 
 async function restoreLockData() {
-  const sessionId = sessionStorage.getItem(KEY.SESSION_ID);
+  let sessionId = sessionStorage.getItem(KEY.SESSION_ID);
+
+  // If no sessionId stored, check if the server has an active session for this user
+  if (!sessionId) {
+    const clientId = getClientId();
+    if (!clientId) return;
+    try {
+      const res  = await fetch(`${getServerUrl()}/api/find-session/${clientId}`);
+      const data = await res.json();
+      if (data.sessionId) {
+        sessionId = data.sessionId;
+        sessionStorage.setItem(KEY.SESSION_ID, sessionId);
+      }
+    } catch {}
+  }
+
   if (!sessionId) return;
 
   try {
@@ -1517,7 +1544,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // ── Dev escape hatch (remove before shipping) ──────
   document.addEventListener('keydown', e => {
-    if (e.key === 'Escape' && state.locked) unlockQueue();
+    if (e.key === 'Escape' && state.locked) {
+      console.log('unlock — sessionId:', state.sessionId);
+      unlockQueue();
+    }
   });
 
   // ── Boot ───────────────────────────────────────────
