@@ -70,6 +70,31 @@
     }
     .btn-danger:hover:not(:disabled) { background: #c0392b; }
 
+    /* ─── Challenge Modal ──────────────────────────────────────────────── */
+    #challenge-overlay {
+      position: fixed; inset: 0;
+      background: rgba(0,0,0,0.85);
+      display: flex; align-items: center; justify-content: center;
+      z-index: 200;
+    }
+    #challenge-overlay.hidden { display: none; }
+
+    .challenge-dots {
+      display: flex; gap: 0.75rem; margin-bottom: 1.5rem;
+    }
+    .dot-pip {
+      width: 16px; height: 16px; border-radius: 50%;
+      background: var(--surface3);
+      transition: background 0.2s;
+    }
+    .dot-pip.done { background: var(--green); }
+    .dot-pip.wrong { background: var(--danger); }
+
+    .challenge-question {
+      font-size: 2.5rem; font-weight: 900;
+      text-align: center; letter-spacing: -0.02em;
+    }
+
     /* ─── Lock Action ──────────────────────────────────────────────────── */
     #main-action {
       display: flex;
@@ -781,7 +806,10 @@
         <div class="dot"></div>
         Queue Locked
       </div>
-      <span class="paused-badge" id="paused-indicator" style="display:none;">Paused</span>
+      <div style="display:flex;gap:0.5rem;align-items:center;">
+        <span class="paused-badge" id="paused-indicator" style="display:none;">Paused</span>
+        <button class="btn-danger" id="unlock-btn" style="padding:0.45rem 1.1rem;font-size:0.8rem;">Unlock</button>
+      </div>
     </div>
 
     <div class="now-playing-info">
@@ -808,6 +836,37 @@
     <div id="lock-error" class="error-msg" style="display:none;"></div>
   </section>
 
+</div>
+
+<!-- ─── Unlock Challenge Modal ────────────────────────────────────────── -->
+<div id="challenge-overlay" class="hidden">
+  <div class="modal" role="dialog">
+    <h2 id="challenge-title">So you want to skip? 🤔</h2>
+    <p style="color:var(--text-dim);margin:0.5rem 0 1.5rem;">Solve 3 in a row to unlock. Wrong answer resets your streak.</p>
+
+    <div class="challenge-dots" id="challenge-dots">
+      <span class="dot-pip"></span>
+      <span class="dot-pip"></span>
+      <span class="dot-pip"></span>
+    </div>
+
+    <div class="challenge-question" id="challenge-question"></div>
+
+    <div style="display:flex;gap:0.75rem;margin-top:1.25rem;">
+      <input id="challenge-input" type="number" placeholder="Your answer" style="
+        flex:1;background:var(--surface2);border:1px solid var(--surface3);
+        border-radius:var(--radius-sm);padding:0.65rem 1rem;color:var(--text);
+        font-size:1.1rem;font-family:inherit;
+      " />
+      <button class="btn-primary" id="challenge-submit">Check</button>
+    </div>
+
+    <div id="challenge-feedback" style="margin-top:0.75rem;font-size:0.9rem;min-height:1.2em;"></div>
+
+    <div class="modal-actions" style="margin-top:1.5rem;">
+      <button class="btn-secondary" id="challenge-cancel">Cancel</button>
+    </div>
+  </div>
 </div>
 
 <!-- ─── Toast ─────────────────────────────────────────────────────────── -->
@@ -1431,6 +1490,78 @@ async function onAuthenticated() {
 }
 
 /* ================================================================
+   UNLOCK CHALLENGE
+   ================================================================ */
+let challengeStreak   = 0;
+let challengeAnswer   = 0;
+
+function randInt(min, max) {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+function newQuestion() {
+  const a = randInt(2, 12);
+  const b = randInt(2, 12);
+  challengeAnswer = a * b;
+  document.getElementById('challenge-question').textContent = `${a} × ${b} = ?`;
+  document.getElementById('challenge-input').value = '';
+  document.getElementById('challenge-feedback').textContent = '';
+  document.getElementById('challenge-input').focus();
+}
+
+function updateDots() {
+  const pips = document.querySelectorAll('.dot-pip');
+  pips.forEach((pip, i) => {
+    pip.classList.toggle('done', i < challengeStreak);
+    pip.classList.remove('wrong');
+  });
+}
+
+function startUnlockChallenge() {
+  if (!state.locked) return;
+  challengeStreak = 0;
+  document.getElementById('challenge-overlay').classList.remove('hidden');
+  updateDots();
+  newQuestion();
+}
+
+function closeChallenge() {
+  document.getElementById('challenge-overlay').classList.add('hidden');
+  document.getElementById('challenge-feedback').textContent = '';
+}
+
+function checkChallengeAnswer() {
+  const input = document.getElementById('challenge-input');
+  const feedback = document.getElementById('challenge-feedback');
+  const val = parseInt(input.value, 10);
+
+  if (isNaN(val)) return;
+
+  if (val === challengeAnswer) {
+    challengeStreak++;
+    updateDots();
+
+    if (challengeStreak >= 3) {
+      closeChallenge();
+      unlockQueue();
+      return;
+    }
+
+    feedback.style.color = 'var(--green)';
+    feedback.textContent = '✓ Correct! Keep going…';
+    setTimeout(newQuestion, 600);
+  } else {
+    // Flash wrong on all earned dots then reset
+    const pips = document.querySelectorAll('.dot-pip');
+    pips.forEach((pip, i) => { if (i < challengeStreak) pip.classList.add('wrong'); });
+    challengeStreak = 0;
+    feedback.style.color = 'var(--danger)';
+    feedback.textContent = `✗ Wrong — streak reset! It was ${challengeAnswer}.`;
+    setTimeout(() => { updateDots(); newQuestion(); }, 1000);
+  }
+}
+
+/* ================================================================
    SETUP MODAL
    ================================================================ */
 function showSetupModal() {
@@ -1534,7 +1665,6 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // ── Logout ─────────────────────────────────────────
   document.getElementById('logout-btn').addEventListener('click', () => {
-    stopWatchdog();
     sessionStorage.clear();
     window.location.reload();
   });
@@ -1542,12 +1672,17 @@ document.addEventListener('DOMContentLoaded', () => {
   // ── Lock ───────────────────────────────────────────
   document.getElementById('lock-btn').addEventListener('click', lockQueue);
 
+  // ── Unlock challenge ───────────────────────────────
+  document.getElementById('unlock-btn').addEventListener('click', startUnlockChallenge);
+  document.getElementById('challenge-cancel').addEventListener('click', closeChallenge);
+  document.getElementById('challenge-submit').addEventListener('click', checkChallengeAnswer);
+  document.getElementById('challenge-input').addEventListener('keydown', e => {
+    if (e.key === 'Enter') checkChallengeAnswer();
+  });
+
   // ── Dev escape hatch (remove before shipping) ──────
   document.addEventListener('keydown', e => {
-    if (e.key === 'Escape' && state.locked) {
-      console.log('unlock — sessionId:', state.sessionId);
-      unlockQueue();
-    }
+    if (e.key === 'Escape' && state.locked) startUnlockChallenge();
   });
 
   // ── Boot ───────────────────────────────────────────
