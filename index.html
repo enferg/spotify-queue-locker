@@ -1048,6 +1048,7 @@ async function handleCallback(code) {
 function startWatchdog() {
   if (state.watchdogTimer) clearInterval(state.watchdogTimer);
   state.watchdogTimer = setInterval(watchdogTick, 2000);
+  startSilentAudio();
 }
 
 function stopWatchdog() {
@@ -1055,6 +1056,35 @@ function stopWatchdog() {
     clearInterval(state.watchdogTimer);
     state.watchdogTimer = null;
   }
+  stopSilentAudio();
+}
+
+/* ── Silent audio: keeps iOS Safari alive in the background ── */
+let _silentCtx = null;
+let _silentSource = null;
+
+function startSilentAudio() {
+  if (_silentCtx) return;
+  try {
+    _silentCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const buffer = _silentCtx.createBuffer(1, _silentCtx.sampleRate, _silentCtx.sampleRate);
+    _silentSource = _silentCtx.createBufferSource();
+    _silentSource.buffer = buffer;
+    _silentSource.loop = true;
+    _silentSource.connect(_silentCtx.destination);
+    _silentSource.start();
+  } catch (e) {
+    console.warn('Silent audio failed:', e);
+  }
+}
+
+function stopSilentAudio() {
+  try {
+    _silentSource?.stop();
+    _silentCtx?.close();
+  } catch {}
+  _silentCtx = null;
+  _silentSource = null;
 }
 
 async function watchdogTick() {
