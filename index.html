@@ -819,8 +819,9 @@
    use the setup modal every time.
    ================================================================ */
 const CONFIG = {
-  CLIENT_ID: '',          // e.g. '4b5f2c1a3d8e...'
+  CLIENT_ID:   '',        // e.g. '4b5f2c1a3d8e...'
   REDIRECT_URI: '',       // defaults to current page URL (computed at runtime)
+  SERVER_URL:  '',        // set to your Railway URL after deploying
   SCOPES: [
     'user-read-playback-state',
     'user-modify-playback-state',
@@ -837,6 +838,8 @@ const KEY = {
   CODE_VERIFIER:  'sql_code_verifier',
   CLIENT_ID:      'sql_client_id',
   REDIRECT_URI:   'sql_redirect_uri',
+  REFRESH_TOKEN:  'sql_refresh_token',
+  SESSION_ID:     'sql_session_id',
   LOCK_DATA:      'sql_lock_data',
 };
 
@@ -844,15 +847,11 @@ const KEY = {
    STATE
    ================================================================ */
 let state = {
-  token:          null,
-  searchResults:  [],
-  selectedAlbum:  null,
-  albumTracks:    [],
-  locked:         false,
-  lockData:       null,    // { albumUri, trackUris[], trackIndex }
-  watchdogTimer:  null,
-  snapCooldown:   false,
-  lastProgress:   null,    // { uri, progress_ms, duration_ms } from previous tick
+  token:           null,
+  locked:          false,
+  lockData:        null,
+  sessionId:       null,
+  statusPollTimer: null,
 };
 
 /* ================================================================
@@ -864,6 +863,11 @@ function getRedirectUri() {
   if (CONFIG.REDIRECT_URI) return CONFIG.REDIRECT_URI;
   // Strip query params & hash from current URL
   return window.location.origin + window.location.pathname;
+}
+
+function getServerUrl() {
+  if (CONFIG.SERVER_URL) return CONFIG.SERVER_URL;
+  return 'http://localhost:3000';
 }
 
 function getClientId() {
@@ -1036,6 +1040,7 @@ async function handleCallback(code) {
   const data = await res.json();
   sessionStorage.setItem(KEY.TOKEN, data.access_token);
   sessionStorage.setItem(KEY.TOKEN_EXP, Date.now() + data.expires_in * 1000);
+  if (data.refresh_token) sessionStorage.setItem(KEY.REFRESH_TOKEN, data.refresh_token);
   sessionStorage.removeItem(KEY.CODE_VERIFIER);
 
   // Clean URL
@@ -1043,133 +1048,37 @@ async function handleCallback(code) {
 }
 
 /* ================================================================
-   WATCHDOG
+   SERVER SESSION + STATUS POLL
    ================================================================ */
-function startWatchdog() {
-  if (state.watchdogTimer) clearInterval(state.watchdogTimer);
-  state.watchdogTimer = setInterval(watchdogTick, 2000);
-  startSilentAudio();
+function startStatusPoll() {
+  if (state.statusPollTimer) clearInterval(state.statusPollTimer);
+  state.statusPollTimer = setInterval(pollServerStatus, 3000);
 }
 
-function stopWatchdog() {
-  if (state.watchdogTimer) {
-    clearInterval(state.watchdogTimer);
-    state.watchdogTimer = null;
+function stopStatusPoll() {
+  if (state.statusPollTimer) {
+    clearInterval(state.statusPollTimer);
+    state.statusPollTimer = null;
   }
-  stopSilentAudio();
 }
 
-/* ── Silent audio: keeps iOS Safari alive in the background ── */
-let _silentCtx = null;
-let _silentSource = null;
-
-function startSilentAudio() {
-  if (_silentCtx) return;
+async function pollServerStatus() {
+  if (!state.sessionId) return;
   try {
-    _silentCtx = new (window.AudioContext || window.webkitAudioContext)();
-    const buffer = _silentCtx.createBuffer(1, _silentCtx.sampleRate, _silentCtx.sampleRate);
-    _silentSource = _silentCtx.createBufferSource();
-    _silentSource.buffer = buffer;
-    _silentSource.loop = true;
-    _silentSource.connect(_silentCtx.destination);
-    _silentSource.start();
-  } catch (e) {
-    console.warn('Silent audio failed:', e);
-  }
-}
+    const res  = await fetch(`${getServerUrl()}/api/status/${state.sessionId}`);
+    const data = await res.json();
 
-function stopSilentAudio() {
-  try {
-    _silentSource?.stop();
-    _silentCtx?.close();
-  } catch {}
-  _silentCtx = null;
-  _silentSource = null;
-}
-
-async function watchdogTick() {
-  if (!state.locked || !state.lockData) return;
-
-  let playback;
-  try { playback = await getPlaybackState(); }
-  catch { return; } // swallow transient errors
-
-  if (!playback) return;
-
-  // Podcasts/episodes: item is null for episodes, so check type before the item guard
-  if (playback.currently_playing_type === 'episode') {
-    if (playback.is_playing && !state.snapCooldown) await snapBack(playback);
-    return;
-  }
-
-  if (!playback.item) return;
-
-  // If paused, just update UI and wait
-  if (!playback.is_playing) {
-    document.getElementById('paused-indicator').style.display = '';
-    updateNowPlayingUI(playback);
-    return;
-  }
-  document.getElementById('paused-indicator').style.display = 'none';
-
-  const currentUri = playback.item?.uri;
-  const { trackUris, trackIndex } = state.lockData;
-
-  const expectedUri = trackUris[trackIndex];
-  const nextUri     = trackUris[trackIndex + 1];
-
-  if (currentUri === expectedUri) {
-    // Still on the correct track
-    updateNowPlayingUI(playback);
-  } else if (currentUri === nextUri) {
-    // Could be natural progression or a manual skip-to-next.
-    // Check if the previous tick showed the track was nearly finished.
-    const prev = state.lastProgress;
-    const nearEnd = prev && prev.uri === expectedUri && prev.duration_ms > 0
-      && (prev.duration_ms - prev.progress_ms) < 10000;
-
-    if (nearEnd) {
-      // Track finished naturally — allow it
-      state.lockData.trackIndex = trackIndex + 1;
-      saveLockData();
-      updateNowPlayingUI(playback);
-      updateProgressUI();
-    } else {
-      // Skipped to next — snap back
-      if (!state.snapCooldown) await snapBack(playback);
+    if (!data.locked) {
+      // Server session gone (server restart etc.) — reset UI
+      unlockQueue(/* serverAlreadyGone */ true);
+      return;
     }
-  } else {
-    // Skipped somewhere else — snap back
-    if (!state.snapCooldown) await snapBack(playback);
-  }
 
-  // Record progress for next tick
-  state.lastProgress = {
-    uri:         currentUri,
-    progress_ms: playback.progress_ms,
-    duration_ms: playback.item?.duration_ms ?? 0,
-  };
-}
-
-async function snapBack(playback) {
-  state.snapCooldown = true;
-  const { trackUris, trackIndex } = state.lockData;
-  const deviceId = playback?.device?.id;
-
-  try {
-    const path = deviceId ? `/me/player/play?device_id=${deviceId}` : '/me/player/play';
-    await spotifyFetch(path, {
-      method: 'PUT',
-      body: JSON.stringify({ uris: trackUris.slice(trackIndex), position_ms: 0 }),
-    });
-    showToast('⚡ Snapped back! Stay focused.');
-    updateProgressUI();
-  } catch (e) {
-    showToast('Snap-back error: ' + e.message);
-    console.warn('Snap-back failed:', e.message);
-  }
-
-  setTimeout(() => { state.snapCooldown = false; }, 3000);
+    if (state.lockData && data.trackIndex !== state.lockData.trackIndex) {
+      state.lockData.trackIndex = data.trackIndex;
+      updateProgressUI();
+    }
+  } catch { /* network blip — ignore */ }
 }
 
 function updateNowPlayingUI(playback) {
@@ -1224,25 +1133,46 @@ async function lockQueue() {
     const trackUris = [current.uri, ...queued.map(t => t.uri)]
       .filter(uri => uri.startsWith('spotify:track:'));
 
-    state.lockData = {
+    // Send to server — server runs the watchdog from here
+    const lockRes = await fetch(`${getServerUrl()}/api/lock`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        accessToken:  sessionStorage.getItem(KEY.TOKEN),
+        refreshToken: sessionStorage.getItem(KEY.REFRESH_TOKEN),
+        tokenExp:     parseInt(sessionStorage.getItem(KEY.TOKEN_EXP), 10),
+        clientId:     getClientId(),
+        trackUris,
+        trackIndex:   0,
+        albumName:    current.album?.name || 'Your Queue',
+        albumArt:     current.album?.images?.[0]?.url || '',
+      }),
+    });
+
+    if (!lockRes.ok) throw new Error('Server error — is the server running?');
+    const { sessionId } = await lockRes.json();
+
+    state.sessionId = sessionId;
+    state.locked    = true;
+    state.lockData  = {
       albumName:  current.album?.name || 'Your Queue',
       albumArt:   current.album?.images?.[0]?.url || '',
       trackUris,
       trackIndex: 0,
     };
-    state.locked = true;
-    saveLockData();
+
+    sessionStorage.setItem(KEY.SESSION_ID, sessionId);
+    sessionStorage.setItem(KEY.LOCK_DATA, JSON.stringify(state.lockData));
 
     document.getElementById('lock-status').classList.add('visible');
     document.getElementById('np-art').src = state.lockData.albumArt;
     document.getElementById('np-track-name').textContent = current.name;
     document.getElementById('np-album-name').textContent = state.lockData.albumName;
     updateProgressUI();
-
     document.getElementById('main-action').style.display = 'none';
 
-    startWatchdog();
-    showToast('Queue locked! 🔒');
+    startStatusPoll();
+    showToast('Queue locked! 🔒 You can close this tab.');
 
   } catch (e) {
     errEl.textContent = e.message;
@@ -1253,11 +1183,22 @@ async function lockQueue() {
   }
 }
 
-function unlockQueue() {
-  state.locked = false;
-  state.lockData = null;
-  stopWatchdog();
+async function unlockQueue(serverAlreadyGone = false) {
+  const sessionId = state.sessionId;
+  state.locked    = false;
+  state.lockData  = null;
+  state.sessionId = null;
+  stopStatusPoll();
+  sessionStorage.removeItem(KEY.SESSION_ID);
   sessionStorage.removeItem(KEY.LOCK_DATA);
+
+  if (sessionId && !serverAlreadyGone) {
+    fetch(`${getServerUrl()}/api/unlock`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionId }),
+    }).catch(() => {});
+  }
 
   document.getElementById('lock-status').classList.remove('visible');
   document.getElementById('paused-indicator').style.display = 'none';
@@ -1265,22 +1206,40 @@ function unlockQueue() {
   document.getElementById('lock-btn').disabled = false;
   document.getElementById('lock-btn').textContent = 'LOCK QUEUE';
 
-  showToast('Queue unlocked.');
+  if (!serverAlreadyGone) showToast('Queue unlocked.');
 }
 
-function saveLockData() {
-  if (state.lockData) {
-    sessionStorage.setItem(KEY.LOCK_DATA, JSON.stringify(state.lockData));
-  }
-}
+async function restoreLockData() {
+  const sessionId = sessionStorage.getItem(KEY.SESSION_ID);
+  if (!sessionId) return;
 
-function restoreLockData() {
-  const raw = sessionStorage.getItem(KEY.LOCK_DATA);
-  if (!raw) return;
   try {
-    state.lockData = JSON.parse(raw);
-    state.locked   = true;
-  } catch { sessionStorage.removeItem(KEY.LOCK_DATA); }
+    const res  = await fetch(`${getServerUrl()}/api/status/${sessionId}`);
+    const data = await res.json();
+
+    if (!data.locked) {
+      sessionStorage.removeItem(KEY.SESSION_ID);
+      sessionStorage.removeItem(KEY.LOCK_DATA);
+      return;
+    }
+
+    // Server still has an active session — restore UI
+    const raw = sessionStorage.getItem(KEY.LOCK_DATA);
+    state.lockData  = raw ? JSON.parse(raw) : { albumName: data.albumName, albumArt: data.albumArt, trackUris: [], trackIndex: data.trackIndex };
+    state.lockData.trackIndex = data.trackIndex;
+    state.locked    = true;
+    state.sessionId = sessionId;
+
+    document.getElementById('lock-status').classList.add('visible');
+    document.getElementById('np-art').src = state.lockData.albumArt || '';
+    document.getElementById('np-album-name').textContent = state.lockData.albumName || '';
+    document.getElementById('main-action').style.display = 'none';
+    updateProgressUI();
+    startStatusPoll();
+  } catch {
+    sessionStorage.removeItem(KEY.SESSION_ID);
+    sessionStorage.removeItem(KEY.LOCK_DATA);
+  }
 }
 
 /* ================================================================
@@ -1440,16 +1399,8 @@ async function onAuthenticated() {
     document.getElementById('logout-btn').style.display = '';
   } catch {}
 
-  // Restore lock if still valid
-  restoreLockData();
-  if (state.locked && state.lockData) {
-    document.getElementById('lock-status').classList.add('visible');
-    document.getElementById('np-art').src = state.lockData.albumArt || '';
-    document.getElementById('np-album-name').textContent = state.lockData.albumName || '';
-    document.getElementById('main-action').style.display = 'none';
-    updateProgressUI();
-    startWatchdog();
-  }
+  // Restore lock if server session still active
+  await restoreLockData();
 }
 
 /* ================================================================
